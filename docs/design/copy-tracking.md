@@ -10,14 +10,329 @@ results of rebasing across remote copies.
 
 ## Objective
 
-Implement extensible APIs for recording and retrieving copy info for the
-purposes of diffing and rebasing across renames and copies more accurately.
-This should be performant both for Git, which synthesizes copy info on the fly
-between arbitrary trees, and for custom extensions which may explicitly record
-and re-serve copy info over arbitrarily large commit ranges.
+Add support for copy information that is sufficient for at least the following
+use cases:
+
+* Diffing: If a file has been copied, show a diff compared to the source version
+  instead of showing a full addition.
+* Merging: When one side of a merge has copied a file and the other side has
+  modified it, propagate the changes to the other side. (There are many other
+  case to handle too.)
+* Log: It should be possible to run something like `jj log -p <file>` and follow
+  the file backwards when it had been created by copying.
+* Annotate (blame): Similar to the log use case, we should follow the file
+  backwards when it had been created by copying.
+
+The solution should support recording and retrieving copy info in a way that
+is performant both for Git, which synthesizes copy info on the fly between
+arbitrary trees, and for custom backends which may explicitly record and
+re-serve copy info over arbitrarily large commit ranges.
 
 The APIs should be defined in a way that makes it easy for custom backends to
 ignore copy info entirely until they are ready to implement it.
+
+## Desired UX
+
+### New commands
+
+We will add `jj file copy` and `jj file move` commands (tenative names) to
+record copy info. As with most commands, they can be run on any commit, and they
+default to running on the current working-copy commit. If the backend supports
+recording copy info, then these commands will update the commit with the copy
+info. Otherwise, they will have no effect (ideally not creating an unchanged
+commit, and ideally telling the user that it had no effect).
+
+### Design goals
+
+#### Restoring from a commit should preserve copies
+
+For example, `jj new X--; jj restore --from X` should restore any copies
+made in `X-` and `X` into the new working copy. Transitive copies should
+be "flattened". For example, if `X-` renamed `foo` to `bar` and `X` renamed
+`bar` to `baz`, then the restored commit should rename `foo` to `baz`.
+
+This also applies to reparenting in general, such as for
+["verbatim rebase"](https://github.com/martinvonz/jj/issues/1027).
+
+#### Diff after restore
+
+`jj restore --from X; jj diff --from X` should be empty.
+
+#### Lossless round-trip of rebase
+
+Except for the `A+(A-B)=A` rule, rebasing is never currently lossy; rebasing a
+commit and then rebasing it back yields the same content. We should ideally
+preserve this property when possible.
+
+For example:
+
+```
+$ jj log
+C rename bar->baz
+|
+B rename foo->bar
+|
+A add foo
+$ jj rebase -r C -d A
+$ jj rebase -r C -d B
+```
+
+In order for that round-trip rebase to be lossless, we would presumably record
+some kind of conflict in the intermediate commit.
+
+#### Backing out parent commit should be a no-op
+
+For example:
+
+```
+$ jj log
+C rename foo->baz
+|
+| B rename foo->bar
+|/
+A add foo
+$ jj rebase -r C -d B
+$ jj backout -r C -d C
+$ jj diff --from B # Should be empty
+```
+
+This is a special case of the lossless rebase.
+
+#### Parallelize/serialize
+
+This is another special case of the lossless rebase.
+
+```
+$ jj log
+E edit qux
+|
+D rename baz->qux
+|
+C rename bar->baz
+|
+B rename foo->bar
+|
+A add foo
+$ jj parallelize B::D
+# There should be no conflict in E and it should look like a
+# regular edit just like before
+$ jj rebase -r C -A B
+$ jj rebase -r D -A C
+# Now we're back to the same graph as before.
+```
+
+#### Copies inside merge commit
+
+We should be able to resolve a naming conflict:
+```
+$ jj log
+D  resolve naming conflict by choosing the name `bar`
+|\
+C | rename foo->baz
+| |
+| B rename foo->bar
+|/
+A add foo
+```
+
+We should also be able to back out that resolution and get back into the
+name-conflicted state.
+
+We should be able to rename files that exist on only one side:
+```
+$ jj log
+D  rename foo2->foo3 and bar2->bar3
+|\
+C | rename bar->bar2
+| |
+| B rename foo->foo2
+|/
+A add foo and bar
+```
+
+## Data model changes
+
+So far, a commit has been purely a snapshot (with some metadata that doesn't
+affect the content or diff in any way). When we add copy info, that is no
+longer true. That's because the copy info we plan to add will indicate copies
+compared to the parent(s), i.e. inherently not snapshot-based.
+
+This has several important consequences:
+
+* Without copy info, if there's a linear chain of commits A..D, you can find
+  the total diff by diffing just D-A. That works because (B-A)+(C-B)+(D-C)
+  simplifies to just D-A. However, if there is copy info, the total diff will
+  involve copy info. If that's associated with the individual commits, we will
+  need to aggregate it somehow.
+* Restoring from another tree is no longer just a matter of copying that tree;
+  we also need to figure out copies between the old tree and the new tree.
+* Conflict states are currently represented by a series of tree states to add
+  and remove. Because we have the individual states, a conflict like
+  `A+(C-B)+(D-C)` can be simplified. With copy tracking, we would need to
+  augment that somehow.
+* If we have a 3-sided conflict where one patch renames foo->bar and the other
+  renames bar->baz, it's not necessarily safe to chain those two together into
+  foo->baz, since foo could be two different files in the two patches'
+  parents. It's also possible that the bar->baz rename should come first and
+  the foo->bar rename should come after.
+
+### Proposed conflict representation
+
+Our `MergedTree` type, which is what calculates a conflicted tree on the fly,
+is currently defined by a series of positive and negative terms. We will
+extend it to instead be a snapshot plus a series of diffs, where each diff
+has attached copy info:
+
+```rust
+struct MergedTree {
+    snapshot: Tree,
+    diffs: Diff
+}
+
+struct Diff {
+    before: Tree,
+    after: Tree,
+    /// Copies from `before` to `after`
+    copies: Vec<CopyInfo>,
+    /// Copies from `before` to `snapshot`
+    copies_to_snapshot: Vec<CopyInfo>,
+}
+
+struct CopyInfo {
+    source: RepoPathBuf,
+    target: RepoPathBuf,
+    // Maybe more fields here for e.g. "do not propagate"
+}
+```
+
+This should be enough to be able to reproduce the state.
+
+### Conflict flattening and simplification
+
+#### Simplification
+
+The tree states will be simplified as before. When a match has been found for
+simplifying (chaining) tree diffs, we will also chain any copy info related to
+the involved diffs. After chaining copies, any remaining copy info that has a
+source that doesn't exist in the `before` tree or a target that doesn't exist in
+the `after` tree will be dropped.
+
+#### Flattening
+
+Merge flattening is when a merge of merges is flattened into a single-level
+merge. That is done by effectively adding diffs from the positive terms and
+by adding reversed diffs from the negative terms.
+
+
+When we add copy info, we should do the same.
+
+
+#### Examples
+
+
+
+
+Example:
+
+```
+D  rename foo->qux
+|
+| C rename bar->baz
+| |
+| B rename foo->bar
+|/
+A add foo
+```
+
+Now rebase B::C onto D. The rebased B (B') will be:
+
+```
+snapshot: D
+diffs: [{
+    before: A
+    after: B
+    copies: [foo->bar]
+    copies_to_snapshot: [foo->qux]
+}]
+```
+
+Rebased C before simplification will be:
+
+```
+snapshot: B'
+diffs: [{
+    before: B
+    after: C
+    copies: [bar->baz]
+    copies_to_snapshot: [bar->qux]
+}]
+```
+
+After expanding B':
+
+```
+snapshot: D
+diffs: [{
+    before: A
+    after: B
+    copies: [foo->bar]
+    copies_to_snapshot: [foo->qux]
+},{
+    before: B
+    after: C
+    copies: [bar->baz]
+    copies_to_snapshot: [bar->qux]
+}]
+```
+
+After simplfication:
+
+```
+snapshot: D
+diffs: [{
+    before: A
+    after: C
+    copies: [foo->baz]
+    copies_to_snapshot: [foo->qux]
+}]
+```
+
+The bar->qux rename was discarded because `bar` doesn't exist in A.
+
+Now rebase B'::C' back onto A. The rebased B' (B'') will be:
+
+```
+snapshot: A
+diffs: [{
+    before: D
+    after: B'
+    copies: [foo->bar]
+    copies_to_snapshot: [foo->qux]
+}]
+```
+
+After expanding B':
+```
+snapshot: D
+diffs: [{
+    before: A
+    after: B
+    copies: [foo->bar]
+    copies_to_snapshot: [foo->qux]
+}]
+```
+
+After simplification:
+```
+snapshot: D
+diffs: [{
+    before: A
+    after: B
+    copies: [foo->bar]
+    copies_to_snapshot: [foo->qux]
+}]
+```
+
 
 ## Interface Design
 
@@ -292,3 +607,31 @@ All copy/move information will be read and written at the file level. While
 `jj cp|mv` may accept directory paths as a convenience and perform the
 appropriate tree modification operations, the renames will be recorded at the
 file level, one for each copied/moved file.
+
+
+## Alternatives considered
+
+### Detect copies (like Git)
+
+Git doesn't record copy info. Instead, it infers it when comparing two trees.
+
+It seems hard to make this model scale to very large repos. By supporting
+querying of copy info only between commits (not trees) as we have in the chosen
+solution, we allow the backend to consider the history when calculating the
+copies.
+
+### Record file IDs in trees (BitKeeper-like model)
+
+BitKeeper records a file ID for each path (or maybe it's a path for each file
+ID). That way you can compare two arbitrary trees, find the added and deleted
+files and just compare the file IDs to figure out which of them are renames.
+
+This model doesn't seem to be easily extensible to support copies (in addition
+to renames).
+
+To perform a rebase across millions of commits, we would not want to diff the
+full trees because that would be too expensive (probably millions of modified
+files). We could perhaps instead find renames by bisecting to find the commit
+deleted any of the files modified in the commit we're rebasing.
+
+Another problem is how to synthesize the file IDs in the Git backend.
