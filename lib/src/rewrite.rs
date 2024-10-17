@@ -451,6 +451,7 @@ impl<'settings, 'repo> DescendantRebaser<'settings, 'repo> {
     }
 }
 
+#[derive(Default)]
 pub struct MoveCommitsStats {
     /// The number of commits in the target set which were rebased.
     pub num_rebased_targets: u32,
@@ -485,12 +486,7 @@ pub fn move_commits(
     options: &RebaseOptions,
 ) -> BackendResult<MoveCommitsStats> {
     if target_commits.is_empty() {
-        return Ok(MoveCommitsStats {
-            num_rebased_targets: 0,
-            num_rebased_descendants: 0,
-            num_skipped_rebases: 0,
-            num_abandoned: 0,
-        });
+        return Ok(MoveCommitsStats::default());
     }
 
     let target_commit_ids: HashSet<_> = target_commits.iter().ids().cloned().collect();
